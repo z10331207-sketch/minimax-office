@@ -1,0 +1,5 @@
+playwright>=1.40.0
+requests>=2.31.0
+cloakbrowser>=0.5.0
+marked
+aiohttp
