@@ -109,9 +109,6 @@ class APIHandler(BaseHTTPRequestHandler):
             want_stream = req_json.get("stream", False)
             res_q = queue.Queue()
             request_queue.put((txt, res_q))
-            
-            ans = None
-            err = None
 
             if want_stream:
                 self.send_response(200)
@@ -121,63 +118,105 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "*")
                 self.end_headers()
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
-
-                # 优先快速发心跳 ping，防止 ZCode 等客户端 10 秒断开
-                for _ in range(180):
-                    try:
-                        ans, err = res_q.get(timeout=1.0)
-                        break
-                    except queue.Empty:
-                        try:
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                        except Exception:
-                            break
-
-                reply_txt = ans if ans else (f"生成异常: {err}" if err else "已收到提问。")
 
                 if is_anthropic:
                     m_start = json.dumps({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": "minimax-m3", "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
                     self.wfile.write(f"event: message_start\ndata: {m_start}\n\n".encode("utf-8"))
                     cb_start = json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
                     self.wfile.write(f"event: content_block_start\ndata: {cb_start}\n\n".encode("utf-8"))
-                    cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reply_txt}})
-                    self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
-                    self.wfile.write(b"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n")
-                    self.wfile.write(b"event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}, \"usage\": {\"output_tokens\": 0}}\n\n")
-                    self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
-                    self.wfile.flush()
                 else:
-                    # 标准 OpenAI SSE 块
-                    chunk_res = {
-                        "id": "chatcmpl-123",
+                    chunk_init = {
+                        "id": "chatcmpl-stream",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": "minimax-m3",
-                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_txt}, "finish_reason": None}]
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
                     }
-                    self.wfile.write(f"data: {json.dumps(chunk_res)}\n\n".encode("utf-8"))
-                    stop_res = {
-                        "id": "chatcmpl-123",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": "minimax-m3",
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                    }
-                    self.wfile.write(f"data: {json.dumps(stop_res)}\n\n".encode("utf-8"))
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-            else:
-                for _ in range(180):
-                    try:
-                        ans, err = res_q.get(timeout=1.0)
-                        break
-                    except queue.Empty:
-                        pass
+                    self.wfile.write(f"data: {json.dumps(chunk_init)}\n\n".encode("utf-8"))
+                self.wfile.flush()
 
-                reply_txt = ans if ans else (f"生成异常: {err}" if err else "已收到您的请求。")
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    try:
+                        item = res_q.get(timeout=2.0)
+                    except queue.Empty:
+                        try:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                        except Exception:
+                            break
+                        continue
+
+                    itype = item.get("type")
+                    if itype == "chunk":
+                        chunk_text = item.get("content", "")
+                        if chunk_text:
+                            if is_anthropic:
+                                cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk_text}})
+                                self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
+                            else:
+                                chunk_res = {
+                                    "id": "chatcmpl-stream",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": "minimax-m3",
+                                    "choices": [{"index": 0, "delta": {"content": chunk_text}, "finish_reason": None}]
+                                }
+                                self.wfile.write(f"data: {json.dumps(chunk_res)}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                    elif itype == "done":
+                        if is_anthropic:
+                            self.wfile.write(b"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n")
+                            self.wfile.write(b"event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}, \"usage\": {\"output_tokens\": 0}}\n\n")
+                            self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                        else:
+                            stop_res = {
+                                "id": "chatcmpl-stream",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": "minimax-m3",
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                            }
+                            self.wfile.write(f"data: {json.dumps(stop_res)}\n\n".encode("utf-8"))
+                            self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        break
+                    elif itype == "error":
+                        err_msg = item.get("error", "未知错误")
+                        if is_anthropic:
+                            cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": f"\n\n[异常] {err_msg}"}})
+                            self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
+                            self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                        else:
+                            stop_res = {
+                                "id": "chatcmpl-stream",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": "minimax-m3",
+                                "choices": [{"index": 0, "delta": {"content": f"\n\n[异常] {err_msg}"}, "finish_reason": "stop"}]
+                            }
+                            self.wfile.write(f"data: {json.dumps(stop_res)}\n\n".encode("utf-8"))
+                            self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        break
+            else:
+                full_text = []
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    try:
+                        item = res_q.get(timeout=2.0)
+                    except queue.Empty:
+                        continue
+                    itype = item.get("type")
+                    if itype == "chunk":
+                        full_text.append(item.get("content", ""))
+                    elif itype == "done":
+                        break
+                    elif itype == "error":
+                        full_text.append(f"\n[错误: {item.get('error')}]")
+                        break
+
+                reply_txt = "".join(full_text) or "已收到您的请求。"
                 if is_anthropic:
                     res = {
                         "id": "msg_123",
@@ -344,6 +383,7 @@ def playwright_executor():
             deadline = time.time() + 170
             generation_started = False
             last_text = ""
+            sent_len = 0
             unchanged_count = 0
 
             while time.time() < deadline:
@@ -381,8 +421,14 @@ def playwright_executor():
                     if is_gen or cur_count > initial_count or (cur_text and cur_text != initial_last_text):
                         generation_started = True
 
-                    if generation_started:
-                        if cur_text == last_text and len(cur_text) > 0 and not is_gen:
+                    if generation_started and cur_text and cur_text != initial_last_text:
+                        # 实时吐字到队列
+                        if len(cur_text) > sent_len:
+                            delta = cur_text[sent_len:]
+                            sent_len = len(cur_text)
+                            rq.put({"type": "chunk", "content": delta})
+
+                        if cur_text == last_text and not is_gen:
                             unchanged_count += 1
                             if unchanged_count >= 2: # 连续 2 秒文字不再变化且没有生成按钮，说明回答结束
                                 ans = cur_text
@@ -396,10 +442,13 @@ def playwright_executor():
             if not ans and last_text and last_text != initial_last_text:
                 ans = last_text
 
+            if ans and len(ans) > sent_len:
+                rq.put({"type": "chunk", "content": ans[sent_len:]})
+
             print(f"-> [成功] 提取到 {len(ans)} 字: {repr(ans[:60])}", flush=True)
-            rq.put((ans or "已收到您的提问", None))
+            rq.put({"type": "done", "content": ans or "已收到您的提问"})
         except Exception as e:
-            rq.put(("", str(e)))
+            rq.put({"type": "error", "error": str(e)})
 
 class ReuseAddressHTTPServer(HTTPServer):
     allow_reuse_address = True
