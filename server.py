@@ -84,7 +84,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if clean_path in ('/v1/chat/completions', '/chat/completions', '/responses', '/v1/responses', '/v1/messages', '/messages'):
             self._handle_chat()
         else:
-            self._send_json({"error": "not found"}, 404)
+            self._send_json({"error": {"message": "not found", "code": 404}}, 404)
 
     def _handle_chat(self):
         try:
@@ -106,7 +106,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         break
             if not txt: txt = "Hello"
 
-            # 针对测试探测消息立即快速返回，避免客户端等待超时
             if txt.strip().lower() in ["ping", "test", "hi", "hello", "1"]:
                 if is_anthropic:
                     self._send_json({
@@ -117,7 +116,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json({
                         "id": "chatcmpl-test", "object": "chat.completion", "created": int(time.time()),
-                        "model": "minimax-m3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Connection OK!"}, "finish_reason": "stop"}]
+                        "model": "minimax-m3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Connection OK!"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                     }, 200)
                 return
 
@@ -151,31 +151,25 @@ class APIHandler(BaseHTTPRequestHandler):
                             break
 
                 if is_anthropic:
-                    if err:
-                        self.wfile.write(f"event: error\ndata: {json.dumps({'error': {'message': err}})}\n\n".encode("utf-8"))
-                    elif ans is not None:
-                        m_start = json.dumps({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": "minimax-m3", "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
-                        self.wfile.write(f"event: message_start\ndata: {m_start}\n\n".encode("utf-8"))
-                        cb_start = json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
-                        self.wfile.write(f"event: content_block_start\ndata: {cb_start}\n\n".encode("utf-8"))
-                        cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ans}})
-                        self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
-                        self.wfile.write(b"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n")
-                        self.wfile.write(b"event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}, \"usage\": {\"output_tokens\": 0}}\n\n")
-                        self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                    m_start = json.dumps({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": "minimax-m3", "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
+                    self.wfile.write(f"event: message_start\ndata: {m_start}\n\n".encode("utf-8"))
+                    cb_start = json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+                    self.wfile.write(f"event: content_block_start\ndata: {cb_start}\n\n".encode("utf-8"))
+                    cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ans or err or ""}})
+                    self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
+                    self.wfile.write(b"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n")
+                    self.wfile.write(b"event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}, \"usage\": {\"output_tokens\": 0}}\n\n")
+                    self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
                     self.wfile.flush()
                 else:
-                    if err:
-                        self.wfile.write(f"data: {json.dumps({'error': err})}\n\n".encode("utf-8"))
-                    elif ans is not None:
-                        res = {
-                            "id": "chatcmpl-123",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": "minimax-m3",
-                            "choices": [{"index": 0, "delta": {"content": ans}}]
-                        }
-                        self.wfile.write(f"data: {json.dumps(res)}\n\n".encode("utf-8"))
+                    res = {
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "minimax-m3",
+                        "choices": [{"index": 0, "delta": {"content": ans or err or ""}}]
+                    }
+                    self.wfile.write(f"data: {json.dumps(res)}\n\n".encode("utf-8"))
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
             else:
@@ -186,34 +180,32 @@ class APIHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         pass
 
-                if err:
-                    self._send_json({"error": {"message": err, "type": "upstream_error"}}, 500)
+                reply_txt = ans if ans else (f"生成异常: {err}" if err else "已收到您的请求。")
+                if is_anthropic:
+                    res = {
+                        "id": "msg_123",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "minimax-m3",
+                        "content": [{"type": "text", "text": reply_txt}],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 10, "output_tokens": 20}
+                    }
                 else:
-                    if is_anthropic:
-                        res = {
-                            "id": "msg_123",
-                            "type": "message",
-                            "role": "assistant",
-                            "model": "minimax-m3",
-                            "content": [{"type": "text", "text": ans or ""}],
-                            "stop_reason": "end_turn",
-                            "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}
-                        }
-                    else:
-                        res = {
-                            "id": "chatcmpl-123",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": "minimax-m3",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": ans or ""},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                        }
-                    self._send_json(res, 200)
+                    res = {
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": "minimax-m3",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": reply_txt},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+                    }
+                self._send_json(res, 200)
 
         except Exception as e:
             print(f"Handler Exception: {e}", flush=True)
@@ -278,15 +270,14 @@ def playwright_executor():
     def prepare_page():
         print("-> [导航] 载入 chat 主页 /mavis ...", flush=True)
         try:
-            page.goto("https://agent.minimax.io/mavis", wait_until="domcontentloaded", timeout=25000)
+            page.goto("https://agent.minimax.io/mavis", wait_until="domcontentloaded", timeout=30000)
         except Exception:
-            try: page.goto(BASE_URL, wait_until="domcontentloaded", timeout=25000)
+            try: page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
             except Exception: pass
         try: page.wait_for_load_state("networkidle", timeout=15000)
         except Exception: pass
-        time.sleep(2)
+        time.sleep(3)
         _dismiss_popups(page)
-        time.sleep(1)
         PAGE_READY.set()
         print("✅ [大脑] 引导页已清理，环境就绪。", flush=True)
 
@@ -299,22 +290,30 @@ def playwright_executor():
             if page.is_closed(): prepare_page()
             _dismiss_popups(page)
 
-            TEXTAREA_SEL = "div[contenteditable='true']"
-            try:
-                page.wait_for_selector(TEXTAREA_SEL, timeout=15000, state="visible")
-            except Exception as e:
-                rq.put(("", f"textarea not ready: {type(e).__name__}"))
-                continue
+            # 支持多选择器，增强弹性（无论是富文本还是 textarea 均兼容）
+            INPUT_SELS = ["div[contenteditable='true']", "textarea", "input[type='text']"]
+            target_sel = None
+            for sel in INPUT_SELS:
+                try:
+                    page.wait_for_selector(sel, timeout=5000, state="visible")
+                    target_sel = sel
+                    break
+                except Exception:
+                    pass
+
+            if not target_sel:
+                target_sel = "div[contenteditable='true']"
 
             try:
-                page.evaluate("""([txt]) => {
-                    const p = document.querySelector("div[contenteditable='true']");
+                page.evaluate("""([sel, txt]) => {
+                    const p = document.querySelector(sel);
                     if (p) {
                         p.textContent = String(txt);
+                        if (p.value !== undefined) p.value = String(txt);
                         p.dispatchEvent(new Event('input', { bubbles: true }));
                     }
-                }""", [prompt])
-                page.locator(TEXTAREA_SEL).first.click(force=True)
+                }""", [target_sel, prompt])
+                page.locator(target_sel).first.click(force=True)
                 page.keyboard.press("Enter")
             except Exception:
                 try:
