@@ -8,7 +8,12 @@ ACCOUNTS_DIR = os.environ.get("MINIMAX_ACCOUNTS_DIR", "/Users/apple/Desktop/goog
 ACTIVE_FILE = os.path.join(ACCOUNTS_DIR, ".active_account")
 BASE_URL = "https://agent.minimax.io/"
 LOGIN_URL = "https://agent.minimax.io/login?sso=1"
-PORT = 8081
+PORT = int(os.environ.get("PORT", 10000))
+
+# 解压账号包
+if os.path.exists("accounts.tar.gz") and not os.path.exists(ACCOUNTS_DIR):
+    import subprocess
+    subprocess.run(["tar", "-xzf", "accounts.tar.gz"], check=False)
 request_queue = queue.Queue()
 
 # page 是否就绪 — keep_alive 用 /v1/ready 等这个
