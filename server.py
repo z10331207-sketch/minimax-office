@@ -566,5 +566,5 @@ class ReuseAddressHTTPServer(HTTPServer):
 
 if __name__ == "__main__":
     threading.Thread(target=playwright_executor, daemon=True).start()
-    print("🚀 [M3 修正大脑] 端口 8081 就绪", flush=True)
-    ReuseAddressHTTPServer(('127.0.0.1', 8081), APIHandler).serve_forever()
+    print(f"🚀 [M3 修正大脑] 端口 {PORT} 就绪 (0.0.0.0)", flush=True)
+    ReuseAddressHTTPServer(('0.0.0.0', PORT), APIHandler).serve_forever()
