@@ -294,7 +294,7 @@ def playwright_executor():
             }""")
             print(f"   [状态] 发送前提问前气泡数: {initial_count}, 末尾预览: {repr(initial_last_text[:30])}", flush=True)
 
-            INPUT_SELS = ["div[contenteditable='true']", "textarea", "input[type='text']"]
+            INPUT_SELS = ['[data-testid="message-textarea"]', "div[contenteditable='true']", "textarea", "input[type='text']"]
             target_sel = None
             for sel in INPUT_SELS:
                 try:
@@ -303,25 +303,35 @@ def playwright_executor():
                     break
                 except Exception: pass
 
-            if not target_sel: target_sel = "div[contenteditable='true']"
+            if not target_sel: target_sel = '[data-testid="message-textarea"]'
 
             try:
-                page.locator(target_sel).first.click(force=True)
-                page.evaluate("""([sel, txt]) => {
-                    const p = document.querySelector(sel);
-                    if (p) {
-                        p.textContent = String(txt);
-                        if (p.value !== undefined) p.value = String(txt);
-                        p.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                }""", [target_sel, prompt])
-                page.keyboard.press("Enter")
-                # 尝试点击发送按钮(兜底，很多界面按回车换行，点发送按钮才发送)
-                page.evaluate("""() => {
-                    const sendBtns = document.querySelectorAll("button[aria-label*='发送'], button[aria-label*='send' i], button[type='submit'], div[role='button'][aria-label*='发送']");
-                    if (sendBtns.length) sendBtns[sendBtns.length - 1].click();
-                }""")
-            except Exception:
+                inp = page.locator(target_sel).first
+                inp.click(force=True)
+                time.sleep(0.3)
+                try:
+                    inp.fill(str(prompt))
+                except Exception:
+                    page.keyboard.type(str(prompt))
+                time.sleep(0.5)
+
+                # 点击发送按钮（div[data-testid="send-button"]）或按回车
+                sent = False
+                for btn_sel in ['[data-testid="send-button"]', 'div[role="button"][aria-label*="Send message"]', 'button[aria-label*="发送"]', 'button[type="submit"]']:
+                    try:
+                        b = page.locator(btn_sel).first
+                        if b.is_visible(timeout=1000):
+                            b.click(force=True)
+                            sent = True
+                            print(f"   [点击发送] 成功点击按钮: {btn_sel}", flush=True)
+                            break
+                    except Exception: pass
+
+                if not sent:
+                    print("   [按回车发送] 未找到可点击按钮，触发 Enter", flush=True)
+                    page.keyboard.press("Enter")
+            except Exception as send_err:
+                print(f"   ⚠️ 输入/发送异常: {send_err}", flush=True)
                 try:
                     page.keyboard.type(str(prompt))
                     page.keyboard.press("Enter")
