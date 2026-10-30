@@ -106,21 +106,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         break
             if not txt: txt = "Hello"
 
-            if txt.strip().lower() in ["ping", "test", "hi", "hello", "1"]:
-                if is_anthropic:
-                    self._send_json({
-                        "id": "msg_test", "type": "message", "role": "assistant", "model": "minimax-m3",
-                        "content": [{"type": "text", "text": "Connection OK! MiniMax M3 is ready."}],
-                        "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
-                    }, 200)
-                else:
-                    self._send_json({
-                        "id": "chatcmpl-test", "object": "chat.completion", "created": int(time.time()),
-                        "model": "minimax-m3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Connection OK!"}, "finish_reason": "stop"}],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                    }, 200)
-                return
-
             want_stream = req_json.get("stream", False)
             res_q = queue.Queue()
             request_queue.put((txt, res_q))
@@ -139,6 +124,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
 
+                # 优先快速发心跳 ping，防止 ZCode 等客户端 10 秒断开
                 for _ in range(180):
                     try:
                         ans, err = res_q.get(timeout=1.0)
@@ -150,26 +136,37 @@ class APIHandler(BaseHTTPRequestHandler):
                         except Exception:
                             break
 
+                reply_txt = ans if ans else (f"生成异常: {err}" if err else "已收到提问。")
+
                 if is_anthropic:
                     m_start = json.dumps({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": "minimax-m3", "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
                     self.wfile.write(f"event: message_start\ndata: {m_start}\n\n".encode("utf-8"))
                     cb_start = json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
                     self.wfile.write(f"event: content_block_start\ndata: {cb_start}\n\n".encode("utf-8"))
-                    cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ans or err or ""}})
+                    cb_delta = json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reply_txt}})
                     self.wfile.write(f"event: content_block_delta\ndata: {cb_delta}\n\n".encode("utf-8"))
                     self.wfile.write(b"event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n")
                     self.wfile.write(b"event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"end_turn\", \"stop_sequence\": null}, \"usage\": {\"output_tokens\": 0}}\n\n")
                     self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
                     self.wfile.flush()
                 else:
-                    res = {
+                    # 标准 OpenAI SSE 块
+                    chunk_res = {
                         "id": "chatcmpl-123",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": "minimax-m3",
-                        "choices": [{"index": 0, "delta": {"content": ans or err or ""}}]
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_txt}, "finish_reason": None}]
                     }
-                    self.wfile.write(f"data: {json.dumps(res)}\n\n".encode("utf-8"))
+                    self.wfile.write(f"data: {json.dumps(chunk_res)}\n\n".encode("utf-8"))
+                    stop_res = {
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "minimax-m3",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    self.wfile.write(f"data: {json.dumps(stop_res)}\n\n".encode("utf-8"))
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
             else:
@@ -290,7 +287,6 @@ def playwright_executor():
             if page.is_closed(): prepare_page()
             _dismiss_popups(page)
 
-            # 支持多选择器，增强弹性（无论是富文本还是 textarea 均兼容）
             INPUT_SELS = ["div[contenteditable='true']", "textarea", "input[type='text']"]
             target_sel = None
             for sel in INPUT_SELS:
@@ -298,11 +294,9 @@ def playwright_executor():
                     page.wait_for_selector(sel, timeout=5000, state="visible")
                     target_sel = sel
                     break
-                except Exception:
-                    pass
+                except Exception: pass
 
-            if not target_sel:
-                target_sel = "div[contenteditable='true']"
+            if not target_sel: target_sel = "div[contenteditable='true']"
 
             try:
                 page.evaluate("""([sel, txt]) => {
