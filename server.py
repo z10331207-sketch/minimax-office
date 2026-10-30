@@ -287,6 +287,13 @@ def playwright_executor():
             if page.is_closed(): prepare_page()
             _dismiss_popups(page)
 
+            # 记录发送前已有的回复气泡数量和最后一条气泡文本（防止抓到欢迎语）
+            initial_count, initial_last_text = page.evaluate("""() => {
+                const els = document.querySelectorAll("[class*='markdown'], [class*='response']");
+                return [els.length, els.length ? els[els.length - 1].innerText.trim() : ''];
+            }""")
+            print(f"   [状态] 发送前提问前气泡数: {initial_count}, 末尾预览: {repr(initial_last_text[:30])}", flush=True)
+
             INPUT_SELS = ["div[contenteditable='true']", "textarea", "input[type='text']"]
             target_sel = None
             for sel in INPUT_SELS:
@@ -299,6 +306,7 @@ def playwright_executor():
             if not target_sel: target_sel = "div[contenteditable='true']"
 
             try:
+                page.locator(target_sel).first.click(force=True)
                 page.evaluate("""([sel, txt]) => {
                     const p = document.querySelector(sel);
                     if (p) {
@@ -307,30 +315,78 @@ def playwright_executor():
                         p.dispatchEvent(new Event('input', { bubbles: true }));
                     }
                 }""", [target_sel, prompt])
-                page.locator(target_sel).first.click(force=True)
                 page.keyboard.press("Enter")
+                # 尝试点击发送按钮(兜底，很多界面按回车换行，点发送按钮才发送)
+                page.evaluate("""() => {
+                    const sendBtns = document.querySelectorAll("button[aria-label*='发送'], button[aria-label*='send' i], button[type='submit'], div[role='button'][aria-label*='发送']");
+                    if (sendBtns.length) sendBtns[sendBtns.length - 1].click();
+                }""")
             except Exception:
                 try:
                     page.keyboard.type(str(prompt))
                     page.keyboard.press("Enter")
                 except Exception: pass
 
-            time.sleep(3)
+            time.sleep(2)
+            _dismiss_popups(page)
+
             ans = ""
             deadline = time.time() + 170
+            generation_started = False
+            last_text = ""
+            unchanged_count = 0
+
             while time.time() < deadline:
                 time.sleep(1)
                 try:
-                    txt = page.evaluate("""() => {
-                        const els = document.querySelectorAll("[class*='markdown'], [class*='response']");
-                        if (!els.length) return "";
-                        return els[els.length - 1].innerText.trim();
+                    res = page.evaluate("""() => {
+                        try {
+                            const stopBtns = document.querySelectorAll(
+                                'button[aria-label*="stop" i], button[aria-label*="pause" i], ' +
+                                'button[aria-label*="停止" i], button[aria-label*="停"] , ' +
+                                'button[data-testid*="stop" i]'
+                            );
+                            const isGenerating = stopBtns.length > 0;
+                            const els = document.querySelectorAll("[class*='markdown'], [class*='response']");
+                            const count = els.length;
+                            let lastTxt = "";
+                            if (count > 0) {
+                                const last = els[count - 1];
+                                const clone = last.cloneNode(true);
+                                clone.querySelectorAll("[class*='think'], [class*='reasoning'], details, summary").forEach(el => el.remove());
+                                lastTxt = (clone.innerText || clone.textContent || '').trim();
+                                if (!lastTxt) lastTxt = (last.innerText || last.textContent || '').trim();
+                            }
+                            return { isGenerating, count, lastTxt };
+                        } catch (e) {
+                            return { isGenerating: false, count: 0, lastTxt: "" };
+                        }
                     }""")
-                    if txt and len(txt) > 2:
-                        ans = txt
-                        break
-                except Exception: pass
 
+                    cur_count = res.get("count", 0)
+                    cur_text = res.get("lastTxt", "")
+                    is_gen = res.get("isGenerating", False)
+
+                    # 只要出现停止按钮，或者气泡数量增加，或者内容发生改变且不等于旧内容，说明开始生成了
+                    if is_gen or cur_count > initial_count or (cur_text and cur_text != initial_last_text):
+                        generation_started = True
+
+                    if generation_started:
+                        if cur_text == last_text and len(cur_text) > 0 and not is_gen:
+                            unchanged_count += 1
+                            if unchanged_count >= 2: # 连续 2 秒文字不再变化且没有生成按钮，说明回答结束
+                                ans = cur_text
+                                break
+                        else:
+                            unchanged_count = 0
+                            last_text = cur_text
+                except Exception:
+                    pass
+
+            if not ans and last_text and last_text != initial_last_text:
+                ans = last_text
+
+            print(f"-> [成功] 提取到 {len(ans)} 字: {repr(ans[:60])}", flush=True)
             rq.put((ans or "已收到您的提问", None))
         except Exception as e:
             rq.put(("", str(e)))
